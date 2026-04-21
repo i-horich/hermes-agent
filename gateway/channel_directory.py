@@ -138,19 +138,116 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
 
 def _build_slack(adapter) -> List[Dict[str, str]]:
     """List Slack channels the bot has joined."""
-    # Slack adapter may expose a web client
-    client = getattr(adapter, "_app", None) or getattr(adapter, "_client", None)
+    import asyncio
+
+    app = getattr(adapter, "_app", None)
+    if not app:
+        return _build_from_sessions("slack")
+
+    client = getattr(app, "client", None)
     if not client:
         return _build_from_sessions("slack")
 
-    try:
-        from tools.send_message_tool import _send_slack  # noqa: F401
-        # Use the Slack Web API directly if available
-    except Exception:
-        pass
+    channels: List[Dict[str, str]] = []
 
-    # Fallback to session data
-    return _build_from_sessions("slack")
+    try:
+        # Must run async API calls from sync context
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+        async def _fetch_channels():
+            result = []
+            cursor = None
+            # Fetch public + private channels the bot can see
+            for page in range(10):  # safety limit
+                resp = await client.conversations_list(
+                    types="public_channel",
+                    exclude_archived=True,
+                    limit=200,
+                    **({"cursor": cursor} if cursor else {}),
+                )
+                for ch in resp.get("channels", []):
+                    ch_type = "private" if ch.get("is_private") else "channel"
+                    result.append({
+                        "id": ch["id"],
+                        "name": ch.get("name", ch["id"]),
+                        "type": ch_type,
+                    })
+                cursor = resp.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+
+            # Also fetch DMs (requires im:read scope)
+            try:
+                dm_cursor = None
+                for page in range(5):
+                    resp = await client.conversations_list(
+                        types="im",
+                        limit=200,
+                        **({"cursor": dm_cursor} if dm_cursor else {}),
+                    )
+                    for ch in resp.get("channels", []):
+                        user_id = ch.get("user", "")
+                        name = ch.get("id")
+                        try:
+                            ui = await client.users_info(user=user_id)
+                            profile = ui.get("user", {}).get("profile", {})
+                            name = (
+                                profile.get("display_name")
+                                or profile.get("real_name")
+                                or user_id
+                            )
+                        except Exception:
+                            pass
+                        result.append({
+                            "id": ch["id"],
+                            "name": name,
+                            "type": "dm",
+                        })
+                    dm_cursor = resp.get("response_metadata", {}).get("next_cursor")
+                    if not dm_cursor:
+                        break
+            except Exception as e:
+                logger.debug("Slack DM enumeration skipped: %s", e)
+
+            # And MPIMs (requires mpim:read scope)
+            try:
+                resp = await client.conversations_list(types="mpim", limit=200)
+                for ch in resp.get("channels", []):
+                    result.append({
+                        "id": ch["id"],
+                        "name": ch.get("name", ch["id"]),
+                        "type": "mpim",
+                    })
+            except Exception as e:
+                logger.debug("Slack MPIM enumeration skipped: %s", e)
+
+            return result
+
+        if loop and loop.is_running():
+            # We're inside an async context — use a thread to avoid nested event loop
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                channels = pool.submit(asyncio.run, _fetch_channels()).result(timeout=15)
+        else:
+            channels = asyncio.run(_fetch_channels())
+
+    except Exception as e:
+        logger.warning("Channel directory: Slack API enumeration failed: %s", e)
+        # Fall back to session data
+        return _build_from_sessions("slack")
+
+    # Merge any DMs from session history that API didn't return
+    session_channels = _build_from_sessions("slack")
+    seen_ids = {ch["id"] for ch in channels}
+    for sch in session_channels:
+        if sch["id"] not in seen_ids:
+            channels.append(sch)
+
+    return channels
 
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:

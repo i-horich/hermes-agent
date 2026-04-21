@@ -322,6 +322,9 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    # Slack channel/DM IDs (start with C, D, or G followed by alphanumeric)
+    if platform_name == "slack" and target_ref and target_ref[0] in "CDG" and len(target_ref) >= 9:
+        return target_ref, None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
